@@ -1,0 +1,131 @@
+# ─────────────────────────────────────────────────────────────
+# Pipeline CI/CD - FastAPI
+#   push -> develop : Build -> Imagem -> Deploy HOMOLOGACAO (automatico, porta 8080)
+#   push -> main    : Build -> Imagem -> Aprovacao -> Deploy PRODUCAO
+# ─────────────────────────────────────────────────────────────
+name: CI/CD FastAPI
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [main]
+
+# Variaveis globais: alterar aqui vale para todos os jobs
+env:
+  IMAGE_NAME: senai_fastapi        # nome da imagem (sem o usuario do Docker Hub)
+  CONTAINER_NAME: senai_fastapi    # nome base do container
+  APP_PORT: 8080                   # porta interna do container (Dockerfile)
+
+jobs:
+  # ── JOB 1: Build e testes ──────────────────────────────────
+  Build:
+    name: Compilar Projeto
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências
+        run: |
+          pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest httpx
+
+      - name: Executar testes com pytest
+        run: |
+          PYTHONPATH=. pytest tests/ -v --tb=short
+
+  # ── JOB 2: Imagem Docker ───────────────────────────────────
+  Imagem:
+    name: Construindo Imagem para Docker
+    runs-on: ubuntu-latest
+    needs: Build
+    if: github.event_name == 'push'   # nao publica imagem em Pull Request
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Login no Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build e Push Docker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  # ── JOB 3: Deploy HOMOLOGACAO (automatico, branch develop) ─
+  Deploy_Homologacao:
+    name: Deploy Homologação
+    runs-on: ubuntu-latest
+    needs: Imagem
+    if: github.ref == 'refs/heads/develop'
+    environment: homologacao
+    steps:
+      - name: Deploy via SSH na EC2 de homologação
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HOMOL_EC2_HOST }}
+          username: ${{ secrets.HOMOL_EC2_USERNAME }}
+          key: ${{ secrets.HOMOL_EC2_SSH_KEY }}
+          script: |
+            sudo docker pull ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+            sudo docker stop ${{ env.CONTAINER_NAME }}_homol 2>/dev/null || true
+            sudo docker rm ${{ env.CONTAINER_NAME }}_homol 2>/dev/null || true
+
+            sudo docker run -d \
+              --name ${{ env.CONTAINER_NAME }}_homol \
+              --restart unless-stopped \
+              -p 8080:${{ env.APP_PORT }} \
+              ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+            # Health check pós-deploy
+            sleep 5
+            curl -f http://localhost:8080/health || exit 1
+            echo "Deploy de HOMOLOGAÇÃO concluído com sucesso!"
+            sudo docker image prune -f
+
+  # ── JOB 4: Deploy PRODUCAO (branch main + aprovacao manual) ─
+  Deploy_Producao:
+    name: Deploy Produção
+    runs-on: ubuntu-latest
+    needs: Imagem
+    if: github.ref == 'refs/heads/main'
+    environment: producao   # Environment com "Required reviewers" = aprovação manual
+    steps:
+      - name: Deploy via SSH na EC2 de produção
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            sudo docker pull ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+            sudo docker stop ${{ env.CONTAINER_NAME }}_prd 2>/dev/null || true
+            sudo docker rm ${{ env.CONTAINER_NAME }}_prd 2>/dev/null || true
+
+            sudo docker run -d \
+              --name ${{ env.CONTAINER_NAME }}_prd \
+              --restart unless-stopped \
+              -p 80:${{ env.APP_PORT }} \
+              ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+            # Health check pós-deploy
+            sleep 5
+            curl -f http://localhost:80/health || exit 1
+            echo "Deploy de PRODUÇÃO concluído com sucesso!"
+            sudo docker image prune -f
